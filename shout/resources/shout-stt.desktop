@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Shout
+GenericName=Voice dictation
+Comment=Linux voice dictation engine (whisper.cpp)
+Exec=shout-stt
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;AudioVideo;Audio;
+Keywords=dictation;speech;voice;whisper;stt;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

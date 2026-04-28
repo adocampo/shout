@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shout"
+version = "0.1.0"
+description = "Linux desktop voice dictation engine (whisper.cpp), SuperWhisper-like"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Shout contributors" }]
+keywords = ["whisper", "stt", "dictation", "linux", "wayland", "x11", "qt"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+dependencies = [
+    "PySide6>=6.6",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24",
+    "pywhispercpp>=1.2.0",
+    "requests>=2.31",
+    "tomli-w>=1.0",
+    "jeepney>=0.8",       # D-Bus puro Python para portal GlobalShortcuts
+    "python-xlib>=0.33",  # X11 hotkey + cursor pos
+    "webrtcvad>=2.0.10",  # VAD ligero (silero opcional)
+]
+
+[project.optional-dependencies]
+silero = ["onnxruntime>=1.17"]
+atspi = ["PyGObject>=3.46"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+shout-stt = "shout.app:main"
+shoutd = "shout.app:main"
+
+[project.urls]
+Homepage = "https://github.com/malevolent/shout"
+
+[tool.setuptools.packages.find]
+include = ["shout*"]
+
+[tool.setuptools.package-data]
+shout = ["resources/**/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = ["E501"]
