@@ -39,6 +39,15 @@ class AudioConfig:
     vad_aggressiveness: int = 2
     # Stop recording after this many ms of trailing silence
     silence_timeout_ms: int = 800
+    # Force a transcription flush after this many seconds without a silence
+    # pause, so the user sees text appearing while still speaking and we never
+    # exceed Whisper's 30 s context window (which would silently drop the start
+    # of long uninterrupted speech).
+    max_chunk_seconds: int = 8
+    # When a forced flush happens mid-speech, keep this many ms of trailing
+    # audio so the next chunk re-includes the cut word and Whisper can still
+    # transcribe it correctly. The duplicated text is then deduplicated.
+    forced_flush_overlap_ms: int = 400
     # Hard cap to avoid runaway sessions
     max_recording_seconds: int = 120
     play_feedback_sounds: bool = True
@@ -49,6 +58,21 @@ class ModelsConfig:
     selected: str = "small-q5_1"
     # Auto-detect language. If False, use the active language from LanguagesConfig.
     auto_detect_language: bool = False
+    # Transcription backend:
+    #   "whisper_cpp"  - subprocess to whisper-cli (default, chunked)
+    #   "streaming"    - faster-whisper + LocalAgreement (real-time, requires `pip install faster-whisper`)
+    backend: str = "whisper_cpp"
+    # Streaming-only options:
+    # faster-whisper model name (e.g. "small", "medium", "large-v3") OR a local CT2 dir.
+    streaming_model: str = "small"
+    # "cuda" | "cpu" | "auto"
+    streaming_device: str = "auto"
+    # "int8" | "int8_float16" | "float16" | "float32"
+    streaming_compute_type: str = "int8_float16"
+    # How often (ms) the streaming loop attempts a partial decode.
+    streaming_step_ms: int = 500
+    # Min audio (ms) accumulated before the first decode of a fresh utterance.
+    streaming_min_chunk_ms: int = 1000
 
 
 @dataclass

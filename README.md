@@ -74,6 +74,122 @@ Optional extras:
 pip install -e '.[silero,atspi,dev]'
 ```
 
+## GPU acceleration (NVIDIA / CUDA)
+
+Shout's transcriber calls the `whisper-cli` binary from
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp) via subprocess. If that
+binary is built with CUDA support, transcription runs on the GPU and is
+roughly **10× faster** than the default CPU build (≈0.4 s vs ≈5 s for a
+3-second chunk on an RTX 3070 Ti with `small-q5_1`).
+
+> Tested with: Arch Linux, NVIDIA driver 565+, CUDA Toolkit 13.x, GCC 15,
+> RTX 3070 Ti (compute capability 8.6). Adapt the architecture flag for your
+> card (Pascal `61`, Turing `75`, Ampere `86`, Ada `89`, Hopper `90`).
+
+### 1. Install the CUDA Toolkit and a compatible compiler
+
+```bash
+# Arch / Manjaro
+sudo pacman -S cuda cudnn cmake gcc git
+```
+
+```bash
+# Debian / Ubuntu — see https://developer.nvidia.com/cuda-downloads
+sudo apt install nvidia-cuda-toolkit cmake build-essential git
+```
+
+```bash
+# Fedora
+sudo dnf install cuda-toolkit cmake gcc-c++ git
+```
+
+Verify the toolchain:
+
+```bash
+nvcc --version       # should print a CUDA release
+nvidia-smi           # should list your GPU and driver
+```
+
+If `nvcc` is not on `PATH`, add it (Arch installs it under `/opt/cuda`):
+
+```bash
+echo 'export PATH=/opt/cuda/bin:$PATH' >> ~/.zshrc
+echo 'export LD_LIBRARY_PATH=/opt/cuda/lib64:$LD_LIBRARY_PATH' >> ~/.zshrc
+exec $SHELL
+```
+
+### 2. Build whisper.cpp with CUDA
+
+Pick the right compute capability for your card and replace `86` below:
+
+| GPU family            | `CMAKE_CUDA_ARCHITECTURES` |
+|-----------------------|----------------------------|
+| GTX 10xx (Pascal)     | `61`                       |
+| RTX 20xx (Turing)     | `75`                       |
+| RTX 30xx (Ampere)     | `86`                       |
+| RTX 40xx (Ada)        | `89`                       |
+| H100 (Hopper)         | `90`                       |
+
+```bash
+git clone --depth 1 https://github.com/ggerganov/whisper.cpp.git /tmp/whisper.cpp
+cd /tmp/whisper.cpp
+cmake -B build \
+    -DGGML_CUDA=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build -j"$(nproc)" --target whisper-cli
+```
+
+Compilation of the CUDA template instances takes 5–15 min depending on the
+machine. When it finishes you'll have `build/bin/whisper-cli` (~1 MB) plus
+`build/src/libwhisper.so` and `build/ggml/src/libggml*.so`.
+
+### 3. Install the binary system-wide
+
+```bash
+sudo cp build/bin/whisper-cli       /usr/local/bin/
+sudo cp build/src/libwhisper.so     /usr/local/lib/
+sudo cp build/ggml/src/libggml*.so  /usr/local/lib/
+sudo ldconfig
+```
+
+### 4. Verify GPU is detected
+
+```bash
+whisper-cli --help | head -2
+# usage: whisper-cli [options] file0 file1 ...
+# supported audio formats: flac, mp3, ogg, wav
+
+# Smoke-test against a model. The boot output should mention CUDA0:
+whisper-cli -m ~/.local/share/shout/models/ggml-small-q5_1.bin -f /dev/null 2>&1 \
+    | grep -E 'cuda|CUDA|device'
+# ggml_cuda_init: found 1 CUDA devices (Total VRAM: 7833 MiB):
+#   Device 0: NVIDIA GeForce RTX 3070 Ti, compute capability 8.6, ...
+# whisper_backend_init_gpu: using CUDA0 backend
+```
+
+That's it — the next time you launch Shout the transcriber will pick up
+`whisper-cli` from `PATH` automatically. To disable GPU temporarily, pass
+`-ng` in the command list (or rebuild without `GGML_CUDA`).
+
+### Troubleshooting
+
+- **`whisper-cli: error while loading shared libraries: libwhisper.so`** —
+  you forgot `sudo ldconfig`, or `/usr/local/lib` is not in your loader path.
+  Fix: `echo /usr/local/lib | sudo tee /etc/ld.so.conf.d/local.conf && sudo ldconfig`.
+- **`nvcc fatal: Unsupported gpu architecture 'compute_XX'`** — your
+  CMake architecture value doesn't match the toolkit. Look up the
+  capability for your card and adjust `-DCMAKE_CUDA_ARCHITECTURES`.
+- **CUDA Toolkit ↔ GCC version mismatch** (e.g. CUDA 12 + GCC 14): install
+  an older GCC and pass `-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-13` to
+  `cmake`.
+- **Driver too old** (`CUDA driver version is insufficient for CUDA runtime
+  version`): update your NVIDIA driver to a version ≥ the toolkit's minimum
+  (CUDA 13 needs driver 560+, CUDA 12 needs 525+).
+- **`out of memory`**: the model needs ~200 MB VRAM for `small`, ~600 MB for
+  `medium`, ~3 GB for `large`. Free VRAM with `nvidia-smi` and close other
+  GPU apps.
+
 ## Run
 
 ```bash
@@ -91,6 +207,57 @@ window from the tray icon (left click) or by running `shout` again.
 
 Download a Whisper model from the **Modelos** tab — `small-q5_1` (~190 MB) is a
 good default for everyday CPU use.
+
+## Real-time streaming backend (experimental)
+
+The default transcription backend (`whisper_cpp`) waits for a silence pause
+(or a max-chunk timeout) before producing text. Shout also ships with an
+**experimental streaming backend** that decodes audio continuously and types
+words as they are confirmed, with ~0.5–1.5 s end-to-end latency on a modern
+NVIDIA GPU.
+
+It uses [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
+(CTranslate2 backend) plus a **LocalAgreement-2** committer: every
+`streaming_step_ms` the rolling audio window is re-decoded, and a token is
+emitted only when two consecutive hypotheses agree on it. This produces a
+"writes as you speak" experience while keeping Whisper's accuracy.
+
+Enable it:
+
+```bash
+.venv/bin/pip install faster-whisper
+# Optionally, for CUDA: pip install ctranslate2 nvidia-cublas-cu12 nvidia-cudnn-cu12
+```
+
+Then in **Ajustes → Avanzado**:
+
+- **Backend de transcripción**: *Streaming en tiempo real (faster-whisper)*
+- **Modelo streaming**: `small`, `medium`, `large-v3` (downloaded on demand
+  to `~/.cache/huggingface/`) or a path to a local CT2 directory.
+
+Tunables in `~/.config/shout/config.toml` under `[models]`:
+
+```toml
+backend = "streaming"
+streaming_model = "small"
+streaming_device = "auto"            # "cuda" | "cpu" | "auto"
+streaming_compute_type = "int8_float16"
+streaming_step_ms = 500              # how often to re-decode
+streaming_min_chunk_ms = 1000        # min audio before first decode
+```
+
+Trade-offs vs the default `whisper_cpp` backend:
+
+- **Pros**: text appears while you speak, no chunk boundary issues, no wasted
+  re-transcriptions on silence.
+- **Cons**: requires Python wheels for `faster-whisper` + `ctranslate2`
+  (~600 MB with CUDA libs); committed text cannot be revised, so a
+  late-arriving word may slightly change punctuation choices that came before
+  it.
+
+This backend lives on the `feature/streaming-faster-whisper` branch until
+benchmarks show a clear win across our es-ES corpus. See
+[TODO.md](TODO.md) for the comparison plan.
 
 ## Notes & known limitations
 

@@ -48,7 +48,7 @@ class HotkeyCaptureButton(QPushButton):
             return
 
         mods = event.modifiers() & _MOD_BIT
-        seq = QKeySequence(int(mods) | int(key))
+        seq = QKeySequence(mods.value | int(key))
         accel = seq.toString(QKeySequence.SequenceFormat.PortableText)
 
         self._accelerator = accel

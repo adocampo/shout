@@ -199,6 +199,14 @@ class SettingsWindow(QMainWindow):
         self.sp_silence.setSuffix(" ms")
         self.sp_silence.setSingleStep(100)
 
+        self.sp_chunk = QSpinBox()
+        self.sp_chunk.setRange(3, 25)
+        self.sp_chunk.setSuffix(" s")
+        self.sp_chunk.setToolTip(
+            "Si hablas sin pausa, se transcribe igualmente cada N segundos.\n"
+            "Mantenlo \u2264 25 para no exceder la ventana de Whisper (30 s)."
+        )
+
         self.sp_max = QSpinBox()
         self.sp_max.setRange(5, 600)
         self.sp_max.setSuffix(" s")
@@ -207,8 +215,9 @@ class SettingsWindow(QMainWindow):
 
         f.addRow("Dispositivo de entrada:", self.cb_device)
         f.addRow(self.cb_vad)
-        f.addRow("Sensibilidad VAD (0–3):", self.sp_vad_aggr)
+        f.addRow("Sensibilidad VAD (0\u20133):", self.sp_vad_aggr)
         f.addRow("Silencio para autocerrar:", self.sp_silence)
+        f.addRow("Transcribir cada (m\u00e1x):", self.sp_chunk)
         f.addRow("Duración máxima:", self.sp_max)
         f.addRow(self.cb_sounds)
         return w
@@ -216,6 +225,20 @@ class SettingsWindow(QMainWindow):
     def _build_advanced_tab(self) -> QWidget:
         w = QWidget()
         f = QFormLayout(w)
+
+        self.cb_backend = QComboBox()
+        for label, key in (
+            ("whisper.cpp (chunked, por defecto)", "whisper_cpp"),
+            ("Streaming en tiempo real (faster-whisper)", "streaming"),
+        ):
+            self.cb_backend.addItem(label, key)
+        self.cb_backend.setToolTip(
+            "Streaming requiere `pip install faster-whisper`.\n"
+            "Decodifica continuamente con LocalAgreement-2 (~0.5\u20131.5 s de latencia)."
+        )
+
+        self.le_stream_model = QLineEdit()
+        self.le_stream_model.setPlaceholderText("small | medium | large-v3 | /ruta/a/modelo-ct2")
 
         self.cb_inj = QComboBox()
         for label, key in (
@@ -242,6 +265,8 @@ class SettingsWindow(QMainWindow):
         self.sp_llm_timeout.setDecimals(0)
         self.sp_llm_timeout.setSuffix(" s")
 
+        f.addRow("Backend de transcripci\u00f3n:", self.cb_backend)
+        f.addRow("Modelo streaming:", self.le_stream_model)
         f.addRow("Backend de inyección:", self.cb_inj)
         f.addRow("Umbral para portapapeles:", self.sp_clip_thr)
         f.addRow(self.cb_llm)
@@ -282,10 +307,15 @@ class SettingsWindow(QMainWindow):
         self.cb_vad.setChecked(c.audio.vad_enabled)
         self.sp_vad_aggr.setValue(c.audio.vad_aggressiveness)
         self.sp_silence.setValue(c.audio.silence_timeout_ms)
+        self.sp_chunk.setValue(c.audio.max_chunk_seconds)
         self.sp_max.setValue(c.audio.max_recording_seconds)
         self.cb_sounds.setChecked(c.audio.play_feedback_sounds)
 
         # Advanced
+        idx = self.cb_backend.findData(c.models.backend)
+        if idx >= 0:
+            self.cb_backend.setCurrentIndex(idx)
+        self.le_stream_model.setText(c.models.streaming_model)
         idx = self.cb_inj.findData(c.injection.backend)
         if idx >= 0:
             self.cb_inj.setCurrentIndex(idx)
@@ -320,11 +350,16 @@ class SettingsWindow(QMainWindow):
         c.audio.vad_enabled = self.cb_vad.isChecked()
         c.audio.vad_aggressiveness = self.sp_vad_aggr.value()
         c.audio.silence_timeout_ms = self.sp_silence.value()
+        c.audio.max_chunk_seconds = self.sp_chunk.value()
         c.audio.max_recording_seconds = self.sp_max.value()
         c.audio.play_feedback_sounds = self.cb_sounds.isChecked()
 
         c.injection.backend = self.cb_inj.currentData()
         c.injection.clipboard_threshold = self.sp_clip_thr.value()
+        c.models.backend = self.cb_backend.currentData()
+        stream_model = self.le_stream_model.text().strip()
+        if stream_model:
+            c.models.streaming_model = stream_model
         c.llm.enabled = self.cb_llm.isChecked()
         c.llm.base_url = self.le_llm_url.text().strip() or c.llm.base_url
         c.llm.model = self.le_llm_model.text().strip() or c.llm.model

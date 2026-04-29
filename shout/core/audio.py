@@ -58,6 +58,29 @@ class AudioCapture:
         self._stream.start()
         self._running = True
 
+    def flush(self, keep_trailing_ms: int = 0) -> bytes:
+        """Return accumulated PCM and clear the buffer, without stopping.
+
+        If ``keep_trailing_ms`` > 0, the last N ms of audio are kept in the
+        buffer to be re-emitted as overlap on the next flush — useful when we
+        cut mid-speech and don't want to lose the word straddling the cut.
+        """
+        with self._lock:
+            data = b"".join(self._buffer)
+            self._buffer.clear()
+            if keep_trailing_ms > 0 and data:
+                keep_bytes = int(self.sample_rate * keep_trailing_ms / 1000) * 2
+                if 0 < keep_bytes < len(data):
+                    self._buffer.append(data[-keep_bytes:])
+        return data
+
+    def buffer_duration_seconds(self) -> float:
+        """Current accumulated audio length in seconds (without flushing)."""
+        with self._lock:
+            n_bytes = sum(len(c) for c in self._buffer)
+        # int16 mono => 2 bytes per sample
+        return n_bytes / 2 / self.sample_rate
+
     def stop(self) -> bytes:
         if not self._running:
             return b""
