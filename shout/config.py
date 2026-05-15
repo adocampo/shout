@@ -84,10 +84,22 @@ class LanguagesConfig:
 
 @dataclass
 class InjectionConfig:
-    # "auto" | "wtype" | "xdotool" | "clipboard"
+    # "auto" | "wtype" | "xdotool" | "clipboard" | "ydotool" | "dotool" | "kdotool-paste"
     backend: str = "auto"
     # If text length exceeds this threshold use clipboard+paste even if direct typing is available.
     clipboard_threshold: int = 200
+    # Clipboard usage policy:
+    #   "never"   -> never touch the clipboard. ydotool types directly
+    #                (caveat: non-US layouts mangle accents/ñ/etc).
+    #   "unicode" -> only use clipboard for chunks that contain non-ASCII
+    #                chars (accents, ñ, …). Pure-ASCII text is typed
+    #                directly with ydotool. Previous clipboard contents
+    #                are saved and restored. RECOMMENDED on KDE Wayland +
+    #                non-US layout, since the virtual-keyboard protocol is
+    #                blocked there and Unicode cannot be typed otherwise.
+    #   "always"  -> always paste via clipboard (Ctrl+V). Restores previous
+    #                clipboard contents.
+    clipboard_policy: str = "unicode"
 
 
 @dataclass

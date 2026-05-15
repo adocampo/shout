@@ -2,14 +2,18 @@
 
 Backends:
   - X11 (`_X11Hotkey`): low-level XGrabKey via python-xlib, supports key release.
+  - evdev (`_EvdevHotkey`): reads raw keyboard events from /dev/input via
+    python-evdev. Works on Wayland without the portal. Requires the user to be
+    in the ``input`` group. Supports key release.
   - Wayland portal (`_PortalHotkey`): full xdg-desktop-portal GlobalShortcuts
     flow (CreateSession → BindShortcuts → Activated). Toggle-only — the portal
-    spec does not deliver key release events to clients.
+    spec does not deliver key release events to clients. Used as fallback when
+    evdev is not available.
 
-Both invoke their callbacks from a background thread; the higher-level glue
+All invoke their callbacks from a background thread; the higher-level glue
 forwards them to the Qt event loop using a QObject + Signal.
 
-If the portal flow fails, Shout still works: the user can configure a custom
+If none of the above work, Shout still works: the user can configure a custom
 shortcut in their compositor (KDE Settings → Shortcuts) to call
 `shout-stt --toggle`, which routes to the running instance via the D-Bus
 service in `dbus_service.py`.
@@ -139,6 +143,248 @@ class _X11Hotkey(HotkeyProvider):
             elif event.type == X.KeyRelease and event.detail == keycode:
                 if self._on_release:
                     self._on_release()
+
+
+# --- evdev backend (Wayland / any) ------------------------------------------
+
+class _EvdevHotkey(HotkeyProvider):
+    """Read raw keyboard events via evdev (/dev/input).
+
+    Works on Wayland without the portal.  Requires read access to
+    ``/dev/input/event*`` — the user must be in the ``input`` group.
+    """
+
+    supports_release = True
+
+    # Lazily initialised class-level lookup tables (need ``evdev`` import).
+    _MOD_GROUPS: dict[str, set[int]] | None = None
+    _ALL_MOD_CODES: set[int] | None = None
+    _KEY_MAP: dict[str, int] | None = None
+
+    # Qt PortableText modifier name → canonical group name
+    _MOD_ALIASES: dict[str, str] = {
+        "ctrl": "ctrl", "control": "ctrl",
+        "alt": "alt",
+        "shift": "shift",
+        "meta": "super",  # Qt Meta == Super/Win on Linux
+        "super": "super", "win": "super",
+    }
+
+    def __init__(self, accelerator: str) -> None:
+        self.accelerator = accelerator
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._on_press: ToggleCallback | None = None
+        self._on_release: ToggleCallback | None = None
+
+    # -- public interface -----------------------------------------------------
+
+    def start(self, on_press, on_release=None) -> None:
+        self._on_press = on_press
+        self._on_release = on_release
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="shout-evdev-hotkey", daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # -- internal helpers -----------------------------------------------------
+
+    @classmethod
+    def _ensure_maps(cls) -> None:
+        """Build the modifier-group and key lookup tables (once)."""
+        if cls._MOD_GROUPS is not None:
+            return
+        from evdev import ecodes as e  # type: ignore[import-untyped]
+
+        cls._MOD_GROUPS = {
+            "ctrl":  {e.KEY_LEFTCTRL,  e.KEY_RIGHTCTRL},
+            "alt":   {e.KEY_LEFTALT,   e.KEY_RIGHTALT},
+            "shift": {e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT},
+            "super": {e.KEY_LEFTMETA,  e.KEY_RIGHTMETA},
+        }
+        cls._ALL_MOD_CODES = set()
+        for codes in cls._MOD_GROUPS.values():
+            cls._ALL_MOD_CODES |= codes
+
+        km: dict[str, int] = {}
+        # Letters a-z
+        for c in range(ord("a"), ord("z") + 1):
+            km[chr(c)] = getattr(e, f"KEY_{chr(c).upper()}")
+        # Digits 0-9
+        for i in range(10):
+            km[str(i)] = getattr(e, f"KEY_{i}")
+        # Function keys F1-F12
+        for i in range(1, 13):
+            km[f"f{i}"] = getattr(e, f"KEY_F{i}")
+        # Named keys (Qt PortableText names, lowercased)
+        km.update({
+            "space": e.KEY_SPACE, "tab": e.KEY_TAB,
+            "return": e.KEY_ENTER, "enter": e.KEY_ENTER,
+            "backspace": e.KEY_BACKSPACE,
+            "del": e.KEY_DELETE, "delete": e.KEY_DELETE,
+            "ins": e.KEY_INSERT, "insert": e.KEY_INSERT,
+            "home": e.KEY_HOME, "end": e.KEY_END,
+            "pgup": e.KEY_PAGEUP, "pgdown": e.KEY_PAGEDOWN,
+            "up": e.KEY_UP, "down": e.KEY_DOWN,
+            "left": e.KEY_LEFT, "right": e.KEY_RIGHT,
+            "esc": e.KEY_ESC, "escape": e.KEY_ESC,
+            "capslock": e.KEY_CAPSLOCK,
+            "print": e.KEY_PRINT, "pause": e.KEY_PAUSE,
+            # Physical-key mappings for non-US layouts
+            "º": e.KEY_GRAVE, "ª": e.KEY_GRAVE,
+            "`": e.KEY_GRAVE, "~": e.KEY_GRAVE,
+            "-": e.KEY_MINUS, "=": e.KEY_EQUAL,
+            "[": e.KEY_LEFTBRACE, "]": e.KEY_RIGHTBRACE,
+            "\\": e.KEY_BACKSLASH,
+            ";": e.KEY_SEMICOLON, "'": e.KEY_APOSTROPHE,
+            ",": e.KEY_COMMA, ".": e.KEY_DOT, "/": e.KEY_SLASH,
+        })
+        cls._KEY_MAP = km
+
+    def _parse(self) -> tuple[frozenset[str], int]:
+        """Return (required modifier group names, target evdev keycode)."""
+        self._ensure_maps()
+        assert self._KEY_MAP is not None
+
+        parts = [p.strip() for p in self.accelerator.split("+") if p.strip()]
+        if not parts:
+            raise ValueError("Empty accelerator")
+
+        key_name = parts[-1].lower()
+        mod_names: set[str] = set()
+        for p in parts[:-1]:
+            group = self._MOD_ALIASES.get(p.lower())
+            if group is None:
+                raise ValueError(f"Unknown modifier: {p}")
+            mod_names.add(group)
+
+        key_code = self._KEY_MAP.get(key_name)
+        if key_code is None:
+            raise ValueError(
+                f"Cannot map key {key_name!r} to evdev code. "
+                "Use a letter, number, function key, or common key name."
+            )
+        return frozenset(mod_names), key_code
+
+    # -- background thread ----------------------------------------------------
+
+    def _run(self) -> None:  # pragma: no cover
+        try:
+            import evdev  # type: ignore[import-untyped]
+            from evdev import ecodes
+        except ImportError:
+            log.error("python-evdev not installed; evdev hotkey disabled")
+            return
+
+        try:
+            required_mods, target_key = self._parse()
+        except ValueError as exc:
+            log.error("Bad accelerator %r for evdev: %s", self.accelerator, exc)
+            return
+
+        assert self._MOD_GROUPS is not None
+
+        # Discover keyboard devices — skip virtual / injector devices
+        _VIRTUAL_NAMES = ("dotool", "ydotool", "virtual")
+        devices: list = []
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+                name_lower = dev.name.lower()
+                if any(v in name_lower for v in _VIRTUAL_NAMES):
+                    log.debug("evdev: skipping virtual device %s (%s)", dev.path, dev.name)
+                    dev.close()
+                    continue
+                caps = dev.capabilities(verbose=False)
+                if ecodes.EV_KEY in caps:
+                    key_caps = caps[ecodes.EV_KEY]
+                    if ecodes.KEY_A in key_caps and ecodes.KEY_Z in key_caps:
+                        devices.append(dev)
+                    else:
+                        dev.close()
+                else:
+                    dev.close()
+            except (PermissionError, OSError) as exc:
+                log.debug("Cannot open %s: %s", path, exc)
+
+        if not devices:
+            log.error(
+                "evdev: no keyboard devices accessible. "
+                "Add your user to the 'input' group: "
+                "sudo usermod -aG input $USER  (then log out and back in)"
+            )
+            return
+
+        log.info(
+            "evdev hotkey: monitoring %d device(s) for %s",
+            len(devices), self.accelerator,
+        )
+
+        import select as _sel
+
+        pressed: set[int] = set()
+        _last_press = 0.0  # debounce: ignore duplicate presses within 100ms
+        _DEBOUNCE = 0.10
+
+        while not self._stop.is_set():
+            try:
+                readable, _, _ = _sel.select(devices, [], [], 0.1)
+            except (ValueError, OSError):
+                devices = [d for d in devices if d.fd >= 0]
+                if not devices:
+                    log.error("evdev: all keyboard devices disconnected")
+                    return
+                continue
+
+            for dev in list(readable):
+                try:
+                    for event in dev.read():
+                        if event.type != ecodes.EV_KEY:
+                            continue
+                        code = event.code
+                        if event.value == 1:  # key down
+                            pressed.add(code)
+                            if code == target_key:
+                                active = frozenset(
+                                    name
+                                    for name, codes in self._MOD_GROUPS.items()
+                                    if codes & pressed
+                                )
+                                if active == required_mods:
+                                    now = time.monotonic()
+                                    if now - _last_press < _DEBOUNCE:
+                                        continue  # duplicate from another interface
+                                    _last_press = now
+                                    if self._on_press:
+                                        try:
+                                            self._on_press()
+                                        except Exception:  # noqa: BLE001
+                                            log.exception("on_press callback failed")
+                        elif event.value == 0:  # key up
+                            if code == target_key and self._on_release:
+                                try:
+                                    self._on_release()
+                                except Exception:  # noqa: BLE001
+                                    log.exception("on_release callback failed")
+                            pressed.discard(code)
+                        # value == 2 → key repeat, ignored
+                except OSError:
+                    log.debug("evdev: device disconnected: %s", dev.path)
+                    try:
+                        dev.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    devices.remove(dev)
+
+        for dev in devices:
+            try:
+                dev.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # --- Portal backend (Wayland) ----------------------------------------------
@@ -368,4 +614,11 @@ class _PortalHotkey(HotkeyProvider):
 def make_hotkey_provider(session: SessionInfo, cfg: HotkeyConfig) -> HotkeyProvider:
     if session.server == DisplayServer.X11:
         return _X11Hotkey(cfg.accelerator)
-    return _PortalHotkey(cfg.accelerator)
+    # Wayland: prefer evdev (reliable, works like Handy's handy-keys),
+    # fall back to portal if python-evdev is not installed.
+    try:
+        import evdev  # type: ignore[import-untyped]  # noqa: F401
+        return _EvdevHotkey(cfg.accelerator)
+    except ImportError:
+        log.info("python-evdev not available; using portal for Wayland hotkey")
+        return _PortalHotkey(cfg.accelerator)

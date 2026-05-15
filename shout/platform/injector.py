@@ -142,6 +142,50 @@ class XdotoolInjector(_Base):
         ])
 
 
+class DotoolInjector(_Base):
+    """Kernel-level uinput injection that respects the keyboard layout.
+
+    Unlike ydotool, dotool links libxkbcommon and uses the active xkb layout,
+    so it can type accented characters / \u00f1 / etc. directly without going
+    through the clipboard. Works on any compositor (X11/Wayland/KDE/GNOME/sway)
+    because the events are injected via /dev/uinput, below the compositor.
+
+    Requires the `dotoold` daemon (or membership in the `input` group plus
+    udev rules) and the `dotool` CLI. See https://git.sr.ht/~geb/dotool .
+
+    Protocol: dotool reads commands from stdin, one per line. We send:
+        keyup ctrl alt shift super
+        typedelay 1
+        type <text>
+    """
+
+    name = "dotool"
+
+    def is_available(self) -> bool:
+        return _which("dotool") is not None
+
+    def inject(self, text: str) -> None:
+        # Release any modifier still held from the activation hotkey, then
+        # type the text. Newlines in the text would be interpreted as command
+        # separators by dotool, so split on them and emit explicit `key enter`
+        # between chunks.
+        lines = text.split("\n")
+        cmds: list[str] = [
+            "keyup ctrl",
+            "keyup alt",
+            "keyup shift",
+            "keyup super",
+            "typedelay 1",
+        ]
+        for i, chunk in enumerate(lines):
+            if i > 0:
+                cmds.append("key enter")
+            if chunk:
+                cmds.append("type " + chunk)
+        payload = ("\n".join(cmds) + "\n").encode("utf-8")
+        _run(["dotool"], stdin=payload, timeout=20)
+
+
 class YdotoolInjector(_Base):
     """Kernel-level uinput injection. Works on any compositor (X11/Wayland/KDE/GNOME/sway).
 
@@ -167,6 +211,10 @@ class YdotoolInjector(_Base):
         125,  # KEY_LEFTMETA / Super
         126,  # KEY_RIGHTMETA
     )
+
+    def __init__(self, clipboard_policy: str = "never") -> None:
+        # "never" | "unicode" | "always"
+        self.clipboard_policy = clipboard_policy
 
     @staticmethod
     def _socket_path() -> str | None:
@@ -215,12 +263,27 @@ class YdotoolInjector(_Base):
         #    AND so the user has time to physically release the hotkey keys.
         time.sleep(0.12)
 
-        # 3) Copy + paste path: ydotool only knows Linux scancodes, which assume
-        #    a US keyboard layout. On any other layout (ES, DE, FR, …) typing
-        #    chars like `_`, `-`, accented vowels, `?`, etc. gets mangled.
-        #    Solution: put the text in the clipboard via wl-copy and synthesize
-        #    Ctrl+V — that shortcut is layout-independent.
-        if _which("wl-copy"):
+        # 3) Decide whether THIS text needs the clipboard path.
+        #    ydotool only knows Linux scancodes (US layout). Non-ASCII chars
+        #    like accents/ñ/¿ get mangled on other layouts. The clipboard
+        #    path uses Ctrl+V which is layout-independent. We save & restore
+        #    the previous clipboard so the user doesn't notice.
+        needs_clipboard = False
+        if self.clipboard_policy == "always":
+            needs_clipboard = True
+        elif self.clipboard_policy == "unicode":
+            needs_clipboard = not text.isascii()
+        if needs_clipboard and _which("wl-copy"):
+            previous = None
+            if _which("wl-paste"):
+                try:
+                    p = subprocess.run(
+                        ["wl-paste", "-n"], capture_output=True, timeout=2, check=False,
+                    )
+                    if p.returncode == 0:
+                        previous = p.stdout
+                except Exception:  # noqa: BLE001
+                    previous = None
             try:
                 _run_detached_writer(["wl-copy"], stdin=text.encode("utf-8"))
                 # Ctrl down (29:1), V down (47:1), V up (47:0), Ctrl up (29:0).
@@ -229,8 +292,20 @@ class YdotoolInjector(_Base):
                 return
             except InjectionError as exc:
                 log.warning("ydotool clipboard-paste failed (%s); falling back to type", exc)
+            finally:
+                # Best-effort restore of the previous clipboard.
+                if previous is not None:
+                    try:
+                        # Tiny delay so the paste keystrokes are consumed first.
+                        time.sleep(0.08)
+                        _run_detached_writer(["wl-copy"], stdin=previous)
+                    except Exception:  # noqa: BLE001
+                        log.warning("Could not restore previous clipboard contents")
 
-        # 4) Fallback: literal typing. Will mangle non-ASCII on non-US layouts.
+        # 4) Direct typing. NEVER touches the clipboard. On non-US keyboard
+        #    layouts some characters may be mistyped; set
+        #    `injection.clipboard_policy` to "unicode" or "always" if that's
+        #    a problem.
         log.debug("exec: ydotool type -- (len=%d) socket=%s", len(text), self._socket_path())
         self._exec(["type", "--key-delay", "12", "--", text], timeout=20)
 
@@ -318,6 +393,7 @@ class CompositeInjector:
         self.cfg = cfg
         self._direct: _Base | None = None
         self._clipboard: _Base | None = None
+        self._dotool: _Base | None = None
         self._ydotool: _Base | None = None
         self._kdotool_paste: _Base | None = None
         self._direct_broken = False
@@ -334,25 +410,42 @@ class CompositeInjector:
             if xd.is_available():
                 self._direct = xd
 
-        cb = ClipboardPasteInjector(self.session.server)
-        if cb.is_available():
-            self._clipboard = cb
+        policy = self.cfg.clipboard_policy
+        allow_clipboard = policy != "never"
 
-        yd = YdotoolInjector()
+        if allow_clipboard:
+            cb = ClipboardPasteInjector(self.session.server)
+            if cb.is_available():
+                self._clipboard = cb
+
+        # dotool: layout-aware uinput injection. Best of both worlds (works on
+        # KDE Wayland AND respects xkb layout for Unicode).
+        dt = DotoolInjector()
+        if dt.is_available():
+            self._dotool = dt
+
+        yd = YdotoolInjector(clipboard_policy=policy)
         if yd.is_available():
             self._ydotool = yd
 
-        if self.session.server == DisplayServer.WAYLAND and self.session.is_kde:
+        if (
+            allow_clipboard
+            and self.session.server == DisplayServer.WAYLAND
+            and self.session.is_kde
+        ):
             kp = KdotoolPasteInjector()
             if kp.is_available():
                 self._kdotool_paste = kp
 
         log.info(
-            "Injector backends: direct=%s clipboard=%s ydotool=%s kdotool_paste=%s",
+            "Injector backends: direct=%s dotool=%s ydotool=%s clipboard=%s "
+            "kdotool_paste=%s clipboard_policy=%s",
             self._direct.name if self._direct else None,
-            self._clipboard.name if self._clipboard else None,
+            self._dotool.name if self._dotool else None,
             self._ydotool.name if self._ydotool else None,
+            self._clipboard.name if self._clipboard else None,
             self._kdotool_paste.name if self._kdotool_paste else None,
+            policy,
         )
 
     def available_backends(self) -> list[str]:
@@ -365,6 +458,13 @@ class CompositeInjector:
 
     def _copy_only(self, text: str) -> None:
         """Last-resort: just copy to the clipboard and ask the user to paste."""
+        if self.cfg.clipboard_policy == "never":
+            raise InjectionError(
+                "El compositor bloquea la inyección directa y el uso del "
+                "portapapeles está desactivado (injection.clipboard_policy=\"never\"). "
+                "Cambia la política a \"unicode\" o \"always\" si quieres que "
+                "Shout pueda copiar al portapapeles como último recurso."
+            )
         server = self.session.server
         if server == DisplayServer.WAYLAND and _which("wl-copy"):
             _run_detached_writer(["wl-copy"], stdin=text.encode("utf-8"))
@@ -387,12 +487,17 @@ class CompositeInjector:
         forced = self.cfg.backend
 
         # Forced backends: try once; on VK-unsupported, degrade to copy-only.
-        if forced in ("wtype", "xdotool", "clipboard", "ydotool", "kdotool-paste"):
+        if forced in ("wtype", "xdotool", "clipboard", "ydotool", "dotool", "kdotool-paste"):
+            if forced in ("clipboard", "kdotool-paste") and self.cfg.clipboard_policy == "never":
+                raise InjectionError(
+                    f"Forced backend {forced!r} requires `injection.clipboard_policy != 'never'`."
+                )
             backend: _Base | None = {
                 "wtype": WtypeInjector(),
                 "xdotool": XdotoolInjector(),
                 "clipboard": self._clipboard,
-                "ydotool": YdotoolInjector(),
+                "dotool": DotoolInjector(),
+                "ydotool": YdotoolInjector(clipboard_policy=self.cfg.clipboard_policy),
                 "kdotool-paste": KdotoolPasteInjector(),
             }[forced]
             if backend is None or not backend.is_available():
@@ -415,21 +520,31 @@ class CompositeInjector:
 
         # Auto mode with self-healing fallbacks.
         order: list[_Base] = []
-        # 1) ydotool first if available: works everywhere, no compositor cooperation needed.
-        if self._ydotool:
-            order.append(self._ydotool)
-        # 2) Direct synthetic typing (wtype/xdotool) when text is short.
-        if self._direct and not self._direct_broken and len(text) <= self.cfg.clipboard_threshold:
-            order.append(self._direct)
-        # 3) kdotool-based clipboard paste (KDE only, no virtual-keyboard needed).
-        if self._kdotool_paste:
-            order.append(self._kdotool_paste)
-        # 4) wtype-based clipboard paste (needs virtual-keyboard protocol).
-        if self._clipboard and not self._clipboard_paste_broken:
-            order.append(self._clipboard)
-        # 5) Direct, even for long text, as a last typed-output attempt.
-        if self._direct and not self._direct_broken and self._direct not in order:
-            order.append(self._direct)
+        policy = self.cfg.clipboard_policy
+        # dotool wins whenever it's installed: layout-aware AND works on every
+        # compositor (uinput-based, but reads xkb).
+        if self._dotool:
+            order.append(self._dotool)
+        if policy == "never":
+            # No clipboard at all: after dotool, try the layout-aware direct
+            # typers (wtype/xdotool); last resort `ydotool type` (US-only).
+            if self._direct and not self._direct_broken:
+                order.append(self._direct)
+            if self._ydotool:
+                order.append(self._ydotool)
+        else:
+            # ydotool next (it decides per-text whether to type or paste
+            # based on `clipboard_policy`).
+            if self._ydotool:
+                order.append(self._ydotool)
+            if self._direct and not self._direct_broken and len(text) <= self.cfg.clipboard_threshold:
+                order.append(self._direct)
+            if self._kdotool_paste:
+                order.append(self._kdotool_paste)
+            if self._clipboard and not self._clipboard_paste_broken:
+                order.append(self._clipboard)
+            if self._direct and not self._direct_broken and self._direct not in order:
+                order.append(self._direct)
 
         last_exc: InjectionError | None = None
         for backend in order:

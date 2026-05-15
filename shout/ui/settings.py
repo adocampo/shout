@@ -243,14 +243,32 @@ class SettingsWindow(QMainWindow):
         self.cb_inj = QComboBox()
         for label, key in (
             ("Auto", "auto"),
+            ("dotool (uinput, layout-aware)", "dotool"),
             ("wtype (Wayland)", "wtype"),
             ("xdotool (X11)", "xdotool"),
+            ("ydotool (uinput, US layout)", "ydotool"),
             ("Portapapeles + pegar", "clipboard"),
         ):
             self.cb_inj.addItem(label, key)
 
         self.sp_clip_thr = QSpinBox()
         self.sp_clip_thr.setRange(0, 100000)
+
+        self.cb_clip_policy = QComboBox()
+        for label, key in (
+            ("Nunca (no tocar el portapapeles)", "never"),
+            ("Solo para acentos / Unicode (recomendado)", "unicode"),
+            ("Siempre (pegar con Ctrl+V)", "always"),
+        ):
+            self.cb_clip_policy.addItem(label, key)
+        self.cb_clip_policy.setToolTip(
+            "\"Nunca\": ydotool escribe directo; en teclados no-US se pierden "
+            "acentos y ñ.\n"
+            "\"Solo para Unicode\": ASCII se escribe directo, los caracteres "
+            "con acento se pegan con Ctrl+V (el portapapeles previo se "
+            "restaura).\n"
+            "\"Siempre\": todo se pega con Ctrl+V."
+        )
 
         self.cb_llm = QCheckBox("Post-procesar con LLM local (OpenAI-compatible)")
         self.le_llm_url = QLineEdit()
@@ -269,6 +287,7 @@ class SettingsWindow(QMainWindow):
         f.addRow("Modelo streaming:", self.le_stream_model)
         f.addRow("Backend de inyección:", self.cb_inj)
         f.addRow("Umbral para portapapeles:", self.sp_clip_thr)
+        f.addRow("Uso del portapapeles:", self.cb_clip_policy)
         f.addRow(self.cb_llm)
         f.addRow("URL base:", self.le_llm_url)
         f.addRow("Modelo:", self.le_llm_model)
@@ -320,6 +339,9 @@ class SettingsWindow(QMainWindow):
         if idx >= 0:
             self.cb_inj.setCurrentIndex(idx)
         self.sp_clip_thr.setValue(c.injection.clipboard_threshold)
+        idx = self.cb_clip_policy.findData(c.injection.clipboard_policy)
+        if idx >= 0:
+            self.cb_clip_policy.setCurrentIndex(idx)
         self.cb_llm.setChecked(c.llm.enabled)
         self.le_llm_url.setText(c.llm.base_url)
         self.le_llm_model.setText(c.llm.model)
@@ -356,6 +378,7 @@ class SettingsWindow(QMainWindow):
 
         c.injection.backend = self.cb_inj.currentData()
         c.injection.clipboard_threshold = self.sp_clip_thr.value()
+        c.injection.clipboard_policy = self.cb_clip_policy.currentData()
         c.models.backend = self.cb_backend.currentData()
         stream_model = self.le_stream_model.text().strip()
         if stream_model:

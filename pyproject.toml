@@ -32,6 +32,7 @@ dependencies = [
     "tomli-w>=1.0",
     "jeepney>=0.8",       # D-Bus puro Python para portal GlobalShortcuts
     "python-xlib>=0.33",  # X11 hotkey + cursor pos
+    "evdev>=1.6",         # evdev hotkey en Wayland (usuario en grupo 'input')
     "webrtcvad>=2.0.10",  # VAD ligero (silero opcional)
 ]
 

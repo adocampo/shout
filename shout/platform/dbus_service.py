@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import QObject, Signal, Slot
-from PySide6.QtDBus import QDBusConnection, QDBusMessage
+from PySide6.QtDBus import QDBus, QDBusConnection, QDBusMessage
 
 log = logging.getLogger(__name__)
 
@@ -118,8 +118,10 @@ def call_remote(method: str) -> bool:
     if not bus.isConnected():
         log.error("D-Bus session not available")
         return False
-    msg = QDBusMessage.createMethodCall(BUS_NAME, OBJECT_PATH, INTERFACE, method)
-    reply = bus.call(msg, mode=QDBusMessage.MessageType.MethodCallMessage, timeout=2000)
+    # Use empty interface — Qt auto-generates the interface name from the class,
+    # and an empty string matches any interface on the object.
+    msg = QDBusMessage.createMethodCall(BUS_NAME, OBJECT_PATH, "", method)
+    reply = bus.call(msg, QDBus.CallMode.Block, 2000)
     if reply.type() == QDBusMessage.MessageType.ErrorMessage:
         log.error("D-Bus call %s failed: %s", method, reply.errorMessage())
         return False
